@@ -111,63 +111,17 @@ requests. Only model operations contact the configured connector. Offline tools,
 dependencies, and network settings for the coding agent itself must be prepared
 separately.
 
-## Run an OpenHands task
+## Windows launcher
 
-`ohands.py` runs the installed OpenHands Software Agent SDK using its embedded
-LiteLLM client and AIGW's Chat Completions endpoint. Use a Python 3.12+ environment
-containing `openhands-sdk`, `openhands-tools`, and `python-dotenv`. Prepare those
-packages and their dependencies through your organization's offline installation
-process. The SDK terminal tool also needs its platform runtime dependencies
-(including tmux where its terminal backend requires it).
+Run `run-aigw.cmd` to check Node.js 22+ and installed runtime dependencies.
+Missing or invalid dependencies are installed with `npm ci --no-audit --no-fund`
+using your configured npm registry before AIGW starts. A valid installed
+dependency tree is reused. Configure your internal Artifactory npm registry
+through your existing npm configuration.
 
-1. Configure `.env` and start AIGW with `npm start` in a separate terminal.
-2. Edit the multiline `PROMPT` and `WORKSPACE` in `ohands.py`.
-3. Activate your SDK's Python environment and run `run-ohands.cmd`. It installs
-   `requirements.txt` and launches `ohands.py`, stopping if installation fails.
-   To launch without reinstalling requirements, use `python ohands.py`.
+## OpenHands client
 
-For offline installation, point the batch file at a folder containing all required
-Python packages (including transitive dependencies):
-
-```bat
-set "AIGW_WHEELHOUSE=C:\path\to\wheels"
-run-ohands.cmd
-```
-
-Without `AIGW_WHEELHOUSE`, pip uses its normal configured package index/cache.
-`run-ohands.cmd` uses the active `python` interpreter and requires Python 3.12 or newer.
-It runs from the AIGW project directory and does not start the gateway server.
-
-The runner registers terminal, file editor, and task tracker tools. The SDK's
-conversation loop executes the task and displays its standard progress output.
-This is a single-task runner, not a persistent interactive chat interface. Tools
-execute locally with the Python process's permissions; the workspace is a working
-directory, not a filesystem sandbox. The supplied prompt requests review only;
-replace it with your implementation task to allow edits.
-
-The runner reads AIGW's `.env` beside `ohands.py` (or the file selected by
-`AIGW_CONFIG`). The model defaults to `openai/{GEMINI_CONNECTOR_MODEL}`. The default
-URL is derived from `HOST` and `PORT`; wildcard bind hosts become loopback.
-Optional runner settings can be placed in `.env` or the process environment:
-`LLM_MODEL` (include `openai/`), `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_TIMEOUT`
-(default 300 seconds), `LLM_MAX_OUTPUT_TOKENS` (8192), `AIGW_WORKSPACE`, and
-`AIGW_MAX_ITERATIONS` (100). The inbound AIGW key is a placeholder, not the enterprise
-connector credential. For container deployments, set `LLM_BASE_URL` to a reachable
-gateway address.
-
-Offline LiteLLM catalog settings are applied before SDK imports. Tokenizer data,
-project dependencies, and any external integrations still need offline preparation.
-Runner tests use SDK mocks: `python -m unittest discover -s tests -p test_run.py`.
-An actual SDK/model run must be verified in your prepared enterprise environment.
-
-## Windows launchers
-
-Start `run-aigw.cmd` to check Node.js 22+ and the installed runtime dependencies.
-If dependencies are missing or invalid, it runs `npm ci --no-audit --no-fund`
-using your configured npm registry, then starts AIGW. A valid installed dependency
-tree is reused without reinstalling it. Configure your internal Artifactory npm
-registry through your existing npm configuration before running this launcher.
-
-In another terminal, use `run-ohands.cmd` to install the Python requirements
-through your configured pip registry (or `AIGW_WHEELHOUSE`) and run `ohands.py`.
-The two launchers change to the project directory before running commands.
+The Python runner is a separate sibling project at `C:\GitHub\shaybc\ohands`.
+Start AIGW here, then run `run-ohands.cmd` from that project. OHANDS has its own
+Python requirements, prompt, and `.env`; point its `LLM_BASE_URL` at this gateway's
+`/v1` endpoint. Enterprise connector credentials remain in AIGW's `.env`.
