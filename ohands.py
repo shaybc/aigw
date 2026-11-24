@@ -2,16 +2,12 @@
 import os
 from pathlib import Path
 
-# Edit this prompt and WORKSPACE, then run: python ohands.py
-PROMPT = """
-Review this project for bugs and explain your findings with file references.
-Do not change any files unless I explicitly request changes in this prompt.
-"""
+# Set OHANDS_PROMPT in .env and edit WORKSPACE, then run: python ohands.py
 WORKSPACE = Path(__file__).resolve().parent
 
 
 def main() -> None:
-    """Load local settings and execute PROMPT with OpenHands' coding tools."""
+    """Load local settings and execute OHANDS_PROMPT with OpenHands' coding tools."""
     from dotenv import load_dotenv
 
     project_directory = Path(__file__).resolve().parent
@@ -25,8 +21,9 @@ def main() -> None:
     workspace = Path(os.environ.get("AIGW_WORKSPACE", str(WORKSPACE))).expanduser().resolve()
     if not workspace.is_dir():
         raise ValueError(f"Workspace is not a directory: {workspace}")
-    if not PROMPT.strip():
-        raise ValueError("Enter a task in the multiline PROMPT variable.")
+    prompt = os.environ.get("OHANDS_PROMPT", "").strip()
+    if not prompt:
+        raise ValueError("Set OHANDS_PROMPT in the .env file or process environment.")
 
     from openhands.sdk import LLM, Agent, Conversation, Tool
     from openhands.tools.file_editor import FileEditorTool
@@ -63,7 +60,7 @@ def main() -> None:
         max_iteration_per_run=int(os.environ.get("AIGW_MAX_ITERATIONS", "100")),
     )
     try:
-        conversation.send_message(PROMPT.strip())
+        conversation.send_message(prompt)
         conversation.run()
     finally:
         conversation.close()
