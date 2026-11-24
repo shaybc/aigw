@@ -1,5 +1,6 @@
 // src/services/ai/geminiConnectorClient.js
 import { logInfo } from "../../utils/logger.js";
+import { fetchConnector } from "./connectorFetch.js";
 import { getAiLogConfigSync, truncateAiLogPayload } from "../../utils/aiLogging.js";
 
 export class GeminiConnectorClient {
@@ -25,7 +26,7 @@ export class GeminiConnectorClient {
 
     logConnectorHttpRequest({ method: "POST", url, body });
 
-    const r = await fetch(url, {
+    const r = await fetchConnector(url, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify(body)
@@ -57,7 +58,7 @@ export class GeminiConnectorClient {
 
     logConnectorHttpRequest({ method: "POST", url, body });
 
-    const r = await fetch(url, {
+    const r = await fetchConnector(url, {
       method: "POST",
       headers: this._headers(),
       body: JSON.stringify(body)
