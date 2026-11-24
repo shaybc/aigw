@@ -15,6 +15,18 @@ test("DCC-compatible gateway baseline", async t => {
     let data = "";
     for await (const chunk of req) data += chunk;
     captured = { url: req.url, headers: req.headers, body: JSON.parse(data) };
+    // Gemini requires functionResponse.response to be a JSON object.
+    for (const turn of captured.body.contents || []) {
+      for (const part of turn.parts || []) {
+        if (!part.functionResponse) continue;
+        const result = part.functionResponse.response;
+        if (result === null || typeof result !== "object" || Array.isArray(result)) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "functionResponse.response must be an object" }));
+          return;
+        }
+      }
+    }
     res.writeHead(status, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ response: answer }));
   });
@@ -165,6 +177,41 @@ test("DCC-compatible gateway baseline", async t => {
     assert.deepEqual(captured.body.contents[1].parts[0].functionCall, { name: "read_project_file", args: { path: "README.md" } });
     assert.deepEqual(captured.body.contents[2].parts[0].functionResponse, { name: "read_project_file", response: { text: "Project README" } });
   });
+  const contentParts = [
+    { type: "text", text: "Files in C:\\Workspace\\project:\nREADME.md" },
+    { type: "text", text: "Second result block" }
+  ];
+  for (const stream of [false, true]) {
+    for (const [label, content, expected] of [
+      ["OpenHands content array", contentParts, { content: contentParts }],
+      ["empty content array", [], { content: [] }],
+      ["JSON array", '["README.md", "src"]', { content: ["README.md", "src"] }],
+      ["JSON number", "42", { content: 42 }],
+      ["JSON boolean", "false", { content: false }],
+      ["JSON null", "null", { content: null }],
+      ["JSON string", '\"done\"', { content: "done" }],
+      ["plain text", "Files listed", { content: "Files listed" }],
+      ["JSON object", '{"files":["README.md"]}', { files: ["README.md"] }],
+      ["null message content", null, { content: "" }],
+      ["omitted message content", undefined, { content: "" }]
+    ]) {
+      await t.test(`tool result ${label} is a Gemini object (stream=${stream})`, async () => {
+        const response = await post("/chat/completions", { stream, messages: [
+          { role: "user", content: "Review project" },
+          { role: "assistant", content: null, tool_calls: [
+            { id: "opaque-editor-call", type: "function", function: { name: "file_editor", arguments: '{"command":"view","path":"README.md"}' } }
+          ] },
+          { role: "tool", tool_call_id: "opaque-editor-call", content }
+        ] });
+        assert.equal(response.status, 200, await response.text());
+        const result = captured.body.contents[2].parts[0].functionResponse;
+        assert.equal(result.name, "file_editor");
+        assert.deepEqual(result.response, expected);
+        assert.equal(typeof result.response, "object");
+        assert.ok(result.response !== null && !Array.isArray(result.response));
+      });
+    }
+  }
   await t.test("parallel tool results resolve opaque IDs and preserve assistant text", async () => {
     const response = await post("/chat/completions", { messages: [
       { role: "user", content: "Inspect files" },

@@ -298,6 +298,11 @@ openaiRouter.post("/chat/completions", async (req, res) => {
             }
           }
 
+          // Gemini requires an object, including when OpenHands returns content blocks.
+          if (responseObj === null || typeof responseObj !== "object" || Array.isArray(responseObj)) {
+            responseObj = { content: responseObj };
+          }
+
           return [{
             role: "user",
             parts: [{ functionResponse: { name, response: responseObj } }]
