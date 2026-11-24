@@ -1,0 +1,862 @@
+// src/routes/openai.js
+import express from "express";
+import { z } from "zod";
+import { env } from "../utils/env.js";
+import { getAiLogConfigSync, truncateAiLogPayload } from "../utils/aiLogging.js";
+import { logError, logInfo } from "../utils/logger.js";
+import { GeminiConnectorClient } from "../services/ai/geminiConnectorClient.js";
+import { GeminiAIStudioClient } from "../services/ai/geminiAIStudioClient.js";
+import { getGeminiSettings, normalizeGeminiClient, normalizeGeminiModel } from "../utils/geminiSettings.js";
+
+const openaiRouter = express.Router();
+
+export default openaiRouter;
+
+async function getClientForModel(modelFromRequest) {
+  const settings = await getGeminiSettings();
+  const selectedClient = normalizeGeminiClient(settings.client, "connector");
+
+  if (selectedClient === "connector") {
+    const connectorId = String(settings.connectorId || "").trim();
+    const baseUrl = String(settings.connectorBaseUrl || "").trim();
+    const apiKey = String(settings.connectorApiKey || "").trim();
+    const model = normalizeGeminiModel(modelFromRequest || settings.connectorModel || env.GEMINI_MODEL);
+
+    if (!connectorId) {
+      throw new Error("Gemini Connector ID is not configured. Please set it in Settings.");
+    }
+    if (!baseUrl) {
+      throw new Error("Gemini Connector base URL is not configured. Please set it in Settings.");
+    }
+    if (!apiKey) {
+      throw new Error("Gemini Connector API key is not configured. Please set it in Settings.");
+    }
+
+    return new GeminiConnectorClient({
+      apiKey,
+      model,
+      connectorId,
+      baseUrl,
+      mode: settings.connectorMode
+    });
+  }
+
+  const model = normalizeGeminiModel(modelFromRequest || settings.model || env.GEMINI_MODEL);
+  const apiKey = String(settings.apiKey || "").trim();
+  if (!apiKey) {
+    throw new Error("Gemini API key is not configured. Please set it in Settings.");
+  }
+
+  return new GeminiAIStudioClient({
+    apiKey,
+    model
+  });
+}
+
+openaiRouter.get("/models", async (req, res) => {
+  const reqId = req._reqId || "no-id";
+  try {
+    const client = await getClientForModel();
+    const data = await client.listModels();
+
+    const payload = {
+      object: "list",
+      data: (data.models || []).map(m => ({
+        id: m.name?.startsWith("models/") ? m.name.slice("models/".length) : m.name,
+        object: "model",
+        created: 0,
+        owned_by: "google"
+      }))
+    };
+    logOpenAiResponse(reqId, "models_json", payload);
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({ error: { message: String(e?.message || e), type: "server_error" } });
+  }
+});
+
+const ChatSchema = z.object({
+  model: z.string().optional(),
+  stream: z.boolean().optional(),
+  messages: z.array(z.object({
+    role: z.enum(["system", "user", "assistant", "tool"]),
+    content: z.union([z.string(), z.array(z.any()), z.null()]).optional(),
+    tool_calls: z.array(z.any()).optional(),
+    tool_call_id: z.string().optional(),
+    name: z.string().optional()
+  })).min(1),
+  temperature: z.number().min(0).max(2).optional(),
+  max_tokens: z.number().min(1).max(65536).optional(),
+  max_completion_tokens: z.number().min(1).max(65536).optional(),
+  max_thinking_tokens: z.number().optional(),
+  tools: z.array(z.any()).optional(),
+  tool_choice: z.any().optional(),
+  stream_options: z.any().optional(),
+  response_format: z.any().optional()
+}).passthrough();
+
+const CompletionSchema = z.object({
+  model: z.string().optional(),
+  stream: z.boolean().optional(),
+  prompt: z.string().min(1),
+  stop: z.union([z.string(), z.array(z.string())]).optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  max_tokens: z.number().min(1).max(65536).optional(),
+  max_completion_tokens: z.number().min(1).max(65536).optional(),
+  max_thinking_tokens: z.number().optional()
+});
+
+openaiRouter.post("/completions", async (req, res) => {
+  const reqId = req._reqId || "no-id";
+  const t0 = Date.now();
+  const enhanceFeature = req.get("X-DCC-Feature") || "";
+  const clientRequestId = req.get("X-DCC-Client-Request-Id") || "none";
+
+  try {
+    if (enhanceFeature === "prompt-enhance") {
+      const rawPrompt = String(req.body?.prompt || "");
+      logInfo(
+        `[PROMPT_ENHANCE] id=${reqId} client_id=${clientRequestId} start body_keys=${Object.keys(req.body || {}).join(",")} prompt_len=${rawPrompt.length} prompt_preview=${JSON.stringify(rawPrompt.slice(0, 120))}`
+      );
+    }
+
+    const parsed = CompletionSchema.parse(req.body);
+    logInfo(`[OPENAI] id=${reqId} ---------- /completions Request Start -------`);
+    logInfo(`[OPENAI] id=${reqId} incoming max_tokens=${parsed.max_tokens} parsed.max_thinking_tokens=${parsed.max_thinking_tokens || 0} temperature=${parsed.temperature}`);
+
+    const client = await getClientForModel(parsed.model);
+    logInfo(`[OPENAI] id=${reqId} completions stream=${Boolean(parsed.stream)} model=${parsed.model || client.model}`);
+
+    const generationConfig = cleanUndefined({
+      temperature: parsed.temperature,
+      maxOutputTokens: parsed.max_completion_tokens ?? parsed.max_tokens,
+      ...(parsed.max_thinking_tokens > 0
+        ? { thinkingConfig: { thinkingBudget: parsed.max_thinking_tokens } }
+        : {})
+    });
+
+    const fimPrompt = parseFimPrompt(parsed.prompt);
+    const generationRequest = {
+      generationConfig: Object.keys(generationConfig).length ? generationConfig : undefined
+    };
+
+    if (fimPrompt) {
+      generationRequest.contents = [{
+        role: "user",
+        parts: [{ text: buildFimInstruction(fimPrompt) }]
+      }];
+    } else {
+      generationRequest.prompt = parsed.prompt;
+    }
+
+    const raw = await client.generateText(generationRequest);
+
+    let text =
+      raw?.candidates?.[0]?.content?.parts?.map(p => p?.text || "").join("") || "";
+    const originalText = text;
+    logInfo(`[OPENAI] id=${reqId} completions_raw_prefix=${JSON.stringify(text.slice(0, 120))} raw_len=${text.length}`);
+    text = stripSingleCodeFence(text);
+    logInfo(`[OPENAI] id=${reqId} completions_after_fence_prefix=${JSON.stringify(text.slice(0, 120))} len=${text.length}`);
+    const normalizedText = text.replace(/\r\n/g, "\n");
+    const normalizedPrompt = parsed.prompt.replace(/\r\n/g, "\n");
+    const commonPrefix = commonPrefixLength(normalizedText, normalizedPrompt);
+    if (commonPrefix > 0 && commonPrefix < normalizedPrompt.length) {
+      const mismatchIndex = commonPrefix;
+      logInfo(`[OPENAI] id=${reqId} completions_prompt_mismatch_at=${mismatchIndex}`);
+      logInfo(`[OPENAI] id=${reqId} completions_prompt_expected=${JSON.stringify(normalizedPrompt.slice(mismatchIndex, mismatchIndex + 80))}`);
+      logInfo(`[OPENAI] id=${reqId} completions_prompt_actual=${JSON.stringify(normalizedText.slice(mismatchIndex, mismatchIndex + 80))}`);
+    }
+    logInfo(`[OPENAI] id=${reqId} completions_prompt_len=${normalizedPrompt.length} prompt_common_prefix=${commonPrefix}`);
+    if (fimPrompt) {
+      text = normalizeFimResponse(text, fimPrompt);
+    } else {
+      text = stripPromptEcho(text, parsed.prompt);
+    }
+    logInfo(`[OPENAI] id=${reqId} completions_after_echo_prefix=${JSON.stringify(text.slice(0, 120))} len=${text.length}`);
+    text = applyStopSequences(text, parsed.stop);
+    logInfo(`[OPENAI] id=${reqId} completions_after_stop_prefix=${JSON.stringify(text.slice(0, 120))} len=${text.length}`);
+    if (originalText && originalText === text) {
+      logInfo(`[OPENAI] id=${reqId} completions_normalization_no_change`);
+    }
+
+    logInfo(`[OPENAI] id=${reqId} completions_text_len=${text.length} preview=${JSON.stringify(text.slice(0, 200))}`);
+
+    const modelName = normalizeGeminiModel(parsed.model || client.model);
+    const created = Math.floor(Date.now() / 1000);
+    const id = `cmpl_${Date.now()}`;
+
+    if (parsed.stream) {
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+
+      writeSseWithLog(res, reqId, {
+        id,
+        object: "text_completion",
+        created,
+        model: modelName,
+        choices: [{ index: 0, text, logprobs: null, finish_reason: null }]
+      });
+
+      writeSseWithLog(res, reqId, {
+        id,
+        object: "text_completion",
+        created,
+        model: modelName,
+        choices: [{ index: 0, text: "", logprobs: null, finish_reason: "stop" }]
+      });
+
+      res.write("data: [DONE]\n\n");
+      logOpenAiResponse(reqId, "completions_sse_done", "[DONE]");
+      res.end();
+
+      logInfo(`[OPENAI] id=${reqId} completions_stream_done total_ms=${Date.now() - t0}`);
+      return;
+    }
+
+    const payload = {
+      id,
+      object: "text_completion",
+      created,
+      model: modelName,
+      choices: [{ index: 0, text, logprobs: null, finish_reason: "stop" }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    };
+    logOpenAiResponse(reqId, "completions_json", payload);
+    res.json(payload);
+
+    logInfo(`[OPENAI] id=${reqId} completions_json_reply_ms=${Date.now() - t0}`);
+    if (enhanceFeature === "prompt-enhance") {
+      logInfo(
+        `[PROMPT_ENHANCE] id=${reqId} client_id=${clientRequestId} success output_len=${text.length} total_ms=${Date.now() - t0}`
+      );
+    }
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (enhanceFeature === "prompt-enhance") {
+      if (e instanceof z.ZodError) {
+        logError(
+          `[PROMPT_ENHANCE] id=${reqId} client_id=${clientRequestId} validation_error issues=${JSON.stringify(e.issues)}`
+        );
+      }
+      logError(
+        `[PROMPT_ENHANCE] id=${reqId} client_id=${clientRequestId} error_ms=${Date.now() - t0} message=${msg}`
+      );
+    }
+    logError(`[OPENAI] id=${reqId} completions_ERROR ${msg}`);
+    res.status(400).json({ error: { message: msg, type: "invalid_request_error" } });
+  }
+});
+
+openaiRouter.post("/chat/completions", async (req, res) => {
+  const reqId = req._reqId || "no-id";
+  const t0 = Date.now();
+  const enhanceFeature = req.get("X-DCC-Feature") || "";
+
+  try {
+    logOpenAiRequest(reqId, "chat_completions_json", req.body);
+    const parsed = ChatSchema.parse(req.body);
+    logInfo(`[OPENAI] id=${reqId} ---------- /chat/completions Request Start -------`);
+    logInfo(`[OPENAI] id=${reqId} incoming max_tokens=${parsed.max_tokens} parsed.max_thinking_tokens=${parsed.max_thinking_tokens || 0} temperature=${parsed.temperature}`);
+
+    const system = parsed.messages.find(m => m.role === "system")?.content;
+    const systemText = typeof system === "string" ? system : "";
+
+    // Resolve results from the actual assistant calls, including caller-generated IDs.
+    const toolNamesById = new Map(parsed.messages
+      .filter(m => m.role === "assistant")
+      .flatMap(m => (m.tool_calls || [])
+        .filter(call => call?.id && call?.function?.name)
+        .map(call => [call.id, call.function.name])));
+
+    const contents = parsed.messages
+      .filter(m => m.role !== "system")
+      .flatMap(m => {
+        // OpenAI -> Gemini message mapping
+        // - assistant -> role "model"
+        // - user/system -> role "user" (system is filtered above)
+        // - tool -> role "user" with a functionResponse part (so Gemini can associate the result to the prior functionCall)
+        //
+        // NOTE: Continue/OpenAI tool messages usually contain only tool_call_id + content.
+        // We therefore encode the function name into the tool_call_id we emit (see response mapping below),
+        // and decode it here.
+        if (m.role === "tool") {
+          const toolCallId = m.tool_call_id || "";
+          const match = /^call_(.+)_\d+$/.exec(toolCallId); // call_<name>_<index>
+          const name = toolNamesById.get(toolCallId) || m.name || (match ? match[1] : "tool");
+
+          let responseObj;
+          if (typeof m.content === "object" && m.content !== null) {
+            responseObj = m.content;
+          } else {
+            const txt = normalizeContentText(m.content);
+            try {
+              responseObj = JSON.parse(txt);
+            } catch {
+              responseObj = { content: txt };
+            }
+          }
+
+          return [{
+            role: "user",
+            parts: [{ functionResponse: { name, response: responseObj } }]
+          }];
+        }
+
+        // If the client re-sends prior assistant tool_calls in history (OpenAI format),
+        // include them as Gemini functionCall parts so Gemini knows a tool was already called.
+        if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+          const callParts = m.tool_calls
+            .filter(tc => tc && tc.type === "function" && tc.function && tc.function.name)
+            .map(tc => {
+              let argsObj = {};
+              try {
+                argsObj = typeof tc.function.arguments === "string"
+                  ? JSON.parse(tc.function.arguments)
+                  : (tc.function.arguments || {});
+              } catch {
+                argsObj = { __raw: String(tc.function.arguments ?? "") };
+              }
+              return { functionCall: { name: tc.function.name, args: argsObj } };
+            });
+
+          const text = normalizeContentText(m.content);
+          const parts = [];
+          if (text.trim().length > 0) parts.push({ text });
+          parts.push(...callParts);
+
+          return parts.length ? [{ role: "model", parts }] : [];
+        }
+
+        const role = m.role === "assistant" ? "model" : "user";
+        const text = normalizeContentText(m.content);
+        if (!text.trim()) return [];
+        return [{ role, parts: [{ text }] }];
+      });
+
+    const client = await getClientForModel(parsed.model);
+    logInfo(`[OPENAI] id=${reqId} chat.completions stream=${Boolean(parsed.stream)} model=${parsed.model || client.model}`);
+
+    if (!contents.length) {
+      return res.status(400).json({ error: { message: "No user message content found", type: "invalid_request_error" } });
+    }
+
+    const generationConfig = cleanUndefined({
+      temperature: parsed.temperature,
+      maxOutputTokens: parsed.max_completion_tokens ?? parsed.max_tokens,
+      ...buildResponseSchema(parsed.response_format),
+      ...(parsed.max_thinking_tokens > 0
+        ? { thinkingConfig: { thinkingBudget: parsed.max_thinking_tokens } }
+        : {})
+    });
+
+    const requestPayload = {
+      contents,
+      system: systemText,
+      generationConfig: Object.keys(generationConfig).length ? generationConfig : undefined,
+      tools: normalizeGeminiTools(parsed.tools),
+      toolConfig: buildToolConfig(parsed.tool_choice)
+    };
+
+    if (parsed.stream) {
+      res.status(200);
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+
+      let toolCallIndex = 0;
+      let sawToolCalls = false;
+
+      try {
+        writeSseWithLog(res, reqId, {
+          id: "chatcmpl_stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: normalizeGeminiModel(parsed.model || client.model),
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
+        });
+
+        for await (const chunk of client.streamGenerateText(requestPayload)) {
+          if (!chunk) continue;
+          const { text, functionCalls } = chunk;
+          if (text) {
+            writeSseWithLog(res, reqId, {
+              id: "chatcmpl_stream",
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: normalizeGeminiModel(parsed.model || client.model),
+              choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+            });
+          }
+          if (functionCalls?.length) {
+            sawToolCalls = true;
+            const toolCalls = functionCalls.map(call => {
+              const currentIndex = toolCallIndex++;
+              const id = `call_${call.name}_${currentIndex}`;
+              return {
+                index: currentIndex,
+                id,
+                type: "function",
+                function: {
+                  name: call.name,
+                  arguments: JSON.stringify(call.args ?? {})
+                }
+              };
+            });
+            writeSseWithLog(res, reqId, {
+              id: "chatcmpl_stream",
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: normalizeGeminiModel(parsed.model || client.model),
+              choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }]
+            });
+          }
+        }
+
+        writeSseWithLog(res, reqId, {
+          id: "chatcmpl_stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: normalizeGeminiModel(parsed.model || client.model),
+          choices: [{ index: 0, delta: {}, finish_reason: sawToolCalls ? "tool_calls" : "stop" }]
+        });
+
+        res.write("data: [DONE]\n\n");
+        logOpenAiResponse(reqId, "chat_completions_sse_done", "[DONE]");
+        res.end();
+
+        logInfo(`[OPENAI] id=${reqId} stream_done total_ms=${Date.now() - t0}`);
+        return;
+      } catch (err) {
+        return handleStreamError(res, reqId, err);
+      }
+    }
+
+    const rawResponse = await client.generateText(requestPayload);
+    logInfo(`[OPENAI] id=${reqId} ai raw response: ${JSON.stringify(rawResponse)}`);
+
+    const { text, functionCalls } = extractGeminiTextAndCalls(rawResponse);
+
+    logInfo(`[OPENAI] id=${reqId} gemini_text_len=${text.length} preview=${JSON.stringify(truncateLogText(text, 300))}`);
+    if (!text.length || enhanceFeature === "definition-intent-search") {
+      const candidate = rawResponse?.candidates?.[0] || {};
+      const finishReason = String(candidate?.finishReason || "");
+      const safetyRatings = Array.isArray(candidate?.safetyRatings) ? candidate.safetyRatings : [];
+      const promptFeedback = rawResponse?.promptFeedback || null;
+      const usageMetadata = rawResponse?.usageMetadata || null;
+      const resultType = text.length ? "response" : "empty";
+      logInfo(`[OPENAI] id=${reqId} ai_result=${resultType} ai_preview=${JSON.stringify(truncateLogText(text, 300))}`);
+      logInfo(`[OPENAI] id=${reqId} gemini_finish_reason=${JSON.stringify(finishReason)} safety_count=${safetyRatings.length}`);
+      logInfo(`[OPENAI] id=${reqId} gemini_prompt_feedback=${JSON.stringify(promptFeedback)}`);
+      logInfo(`[OPENAI] id=${reqId} gemini_usage=${JSON.stringify(usageMetadata)}`);
+    }
+
+    const modelName = normalizeGeminiModel(parsed.model || client.model);
+    const created = Math.floor(Date.now() / 1000);
+    const id = `chatcmpl_${Date.now()}`;
+
+    // Non-stream JSON
+    const message = {
+      role: "assistant",
+      content: text || null
+    };
+    if (functionCalls.length) {
+      message.tool_calls = toOpenAiToolCalls(functionCalls);
+    }
+
+    const payload = {
+      id,
+      object: "chat.completion",
+      created,
+      model: modelName,
+      choices: [
+        {
+          index: 0,
+          message,
+          finish_reason: functionCalls.length ? "tool_calls" : "stop"
+        }
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    };
+
+    logInfo(`[OPENAI] id=${reqId} json_reply_ms=${Date.now() - t0}`);
+    logOpenAiResponse(reqId, "chat_completions_json", payload);
+    res.json(payload);
+  } catch (e) {
+    if (res.headersSent) {
+      return handleStreamError(res, reqId, e);
+    }
+    const msg = String(e?.message || e);
+    logInfo(`[OPENAI] id=${reqId} ai_result=error ai_preview=${JSON.stringify(truncateLogText(msg, 300))}`);
+    logError(`[OPENAI] id=${reqId} ERROR ${msg}`);
+    res.status(400).json({ error: { message: msg, type: "invalid_request_error" } });
+  }
+});
+
+const EmbeddingsSchema = z.object({
+  model: z.string().optional(),
+  input: z.union([z.string(), z.array(z.string())])
+});
+
+openaiRouter.post("/embeddings", async (req, res) => {
+  const reqId = req._reqId || "no-id";
+  const t0 = Date.now();
+
+  try {
+    const parsed = EmbeddingsSchema.parse(req.body);
+    const modelName = parsed.model || "text-embedding-004";
+
+    logInfo(`[OPENAI] id=${reqId} embeddings model=${modelName}`);
+
+    const client = await getClientForModel(modelName);
+    const inputs = Array.isArray(parsed.input) ? parsed.input : [parsed.input];
+
+    const data = [];
+    for (let i = 0; i < inputs.length; i++) {
+      const raw = await client.embedText({ model: modelName, text: inputs[i] });
+      const values = raw?.embedding?.values || [];
+      data.push({ object: "embedding", index: i, embedding: values });
+    }
+
+    logInfo(`[OPENAI] id=${reqId} embeddings_ok count=${data.length} ms=${Date.now() - t0}`);
+
+    const payload = {
+      object: "list",
+      data,
+      usage: { prompt_tokens: 0, total_tokens: 0 }
+    };
+    logOpenAiResponse(reqId, "embeddings_json", payload);
+    res.json(payload);
+  } catch (e) {
+    const msg = String(e?.message || e);
+    logError(`[OPENAI] id=${reqId} embeddings_ERROR ${msg}`);
+    res.status(400).json({ error: { message: msg, type: "invalid_request_error" } });
+  }
+});
+
+function cleanUndefined(obj) {
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
+}
+
+function writeSse(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function writeSseWithLog(res, reqId, payload) {
+  logOpenAiResponse(reqId, "sse_chunk", payload);
+  writeSse(res, payload);
+}
+
+function normalizeContentText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(part => {
+        if (typeof part === "string") return part;
+        if (part?.text) return part.text;
+        return JSON.stringify(part);
+      })
+      .join("\n");
+  }
+  if (content == null) return "";
+  return String(content);
+}
+
+function resolveRefs(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+
+  const defs = schema.$defs || schema.definitions || {};
+
+  function inline(node) {
+    if (!node || typeof node !== "object") return node;
+    if (Array.isArray(node)) return node.map(inline);
+
+    if (node.$ref) {
+      const refKey = node.$ref.replace("#/$defs/", "").replace("#/definitions/", "");
+      return inline(defs[refKey] || node);
+    }
+
+    const result = {};
+    for (const [k, v] of Object.entries(node)) {
+      if (k === "$defs" || k === "definitions") continue;
+      result[k] = inline(v);
+    }
+    return result;
+  }
+
+  return inline(schema);
+}
+
+function buildResponseSchema(responseFormat) {
+  if (!responseFormat) return {};
+
+  if (responseFormat.type === "json_object") {
+    return { responseMimeType: "application/json" };
+  }
+
+  if (responseFormat.type === "json_schema" && responseFormat.json_schema?.schema) {
+    const resolved = resolveRefs(responseFormat.json_schema.schema);
+    return {
+      responseMimeType: "application/json",
+      responseSchema: sanitizeGeminiSchema(resolved)
+    };
+  }
+
+  return {};
+}
+
+function buildToolConfig(toolChoice) {
+  if (!toolChoice) return undefined;
+  if (toolChoice === "none") {
+    return { functionCallingConfig: { mode: "NONE" } };
+  }
+  if (toolChoice === "auto") {
+    return { functionCallingConfig: { mode: "AUTO" } };
+  }
+  if (toolChoice?.type === "function" && toolChoice?.function?.name) {
+    return {
+      functionCallingConfig: {
+        mode: "ANY",
+        allowedFunctionNames: [toolChoice.function.name]
+      }
+    };
+  }
+  return undefined;
+}
+
+function normalizeGeminiTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return undefined;
+  const functionDeclarations = tools
+    .map(tool => {
+      if (tool?.type !== "function" || !tool.function) return null;
+      const { name, description, parameters } = tool.function;
+      if (!name) return null;
+      return {
+        name,
+        description,
+        parameters: sanitizeGeminiSchema(parameters)
+      };
+    })
+    .filter(Boolean);
+
+  if (!functionDeclarations.length) return undefined;
+  return [{ functionDeclarations }];
+}
+
+function sanitizeGeminiSchema(schema) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) {
+    return schema.map(item => sanitizeGeminiSchema(item));
+  }
+
+  const sanitized = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === "additionalProperties") continue;
+    sanitized[key] = sanitizeGeminiSchema(value);
+  }
+  return sanitized;
+}
+
+function extractGeminiTextAndCalls(rawResponse) {
+  const parts = rawResponse?.candidates?.[0]?.content?.parts || [];
+  let text = "";
+  const functionCalls = [];
+
+  for (const part of parts) {
+    if (part?.text) {
+      text += part.text;
+    }
+    if (part?.functionCall?.name) {
+      functionCalls.push(part.functionCall);
+    }
+  }
+
+  return { text, functionCalls };
+}
+
+function toOpenAiToolCalls(functionCalls) {
+  return functionCalls.map((call, index) => ({
+    id: `call_${call.name}_${index}`,
+    type: "function",
+    function: {
+      name: call.name,
+      arguments: JSON.stringify(call.args ?? {})
+    }
+  }));
+}
+
+function handleStreamError(res, reqId, err) {
+  const msg = String(err?.message || err);
+  logError(`[OPENAI] id=${reqId} Stream ERROR ${msg}`);
+  if (!res.headersSent) {
+    res.status(400).json({ error: { message: msg, type: "invalid_request_error" } });
+    return;
+  }
+  writeSseWithLog(res, reqId, {
+    id: "chatcmpl_stream",
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: "unknown",
+    choices: [{ index: 0, delta: {}, finish_reason: "error" }]
+  });
+  res.write("data: [DONE]\n\n");
+  logOpenAiResponse(reqId, "chat_completions_sse_done", "[DONE]");
+  res.end();
+}
+
+function truncateLogText(value, maxLen = 300) {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLen) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLen)}...`;
+}
+
+function logOpenAiRequest(reqId, label, payload) {
+  const aiLogConfig = getAiLogConfigSync();
+  if (!aiLogConfig.openAiResponseEnabled) {
+    return;
+  }
+  const serialized = truncateAiLogPayload(payload, aiLogConfig.responseMaxLength);
+  logInfo(`[OPENAI] id=${reqId} request_${label}=${serialized}`);
+}
+
+function logOpenAiResponse(reqId, label, payload) {
+  const aiLogConfig = getAiLogConfigSync();
+  if (!aiLogConfig.openAiResponseEnabled) {
+    return;
+  }
+  const serialized = truncateAiLogPayload(payload, aiLogConfig.responseMaxLength);
+  logInfo(`[OPENAI] id=${reqId} response_${label}=${serialized}`);
+}
+
+function stripPromptEcho(text, prompt) {
+  if (!text || !prompt) {
+    return text;
+  }
+
+  const normalizedText = text.replace(/\r\n/g, "\n");
+  const normalizedPrompt = prompt.replace(/\r\n/g, "\n");
+
+  if (normalizedText.startsWith(normalizedPrompt)) {
+    return normalizedText.slice(normalizedPrompt.length);
+  }
+
+  if (text.startsWith(prompt)) {
+    return text.slice(prompt.length);
+  }
+
+  const trimmedPrompt = prompt.trimEnd();
+  if (trimmedPrompt && text.startsWith(trimmedPrompt)) {
+    const remainder = text.slice(trimmedPrompt.length);
+    return remainder.startsWith("\n") ? remainder.slice(1) : remainder;
+  }
+
+  return text;
+}
+
+function parseFimPrompt(prompt) {
+  const input = String(prompt || "");
+  const markerSets = [
+    { prefix: "<fim_prefix>", suffix: "<fim_suffix>", middle: "<fim_middle>" },
+    { prefix: "<|fim_prefix|>", suffix: "<|fim_suffix|>", middle: "<|fim_middle|>" }
+  ];
+
+  for (const markers of markerSets) {
+    const prefixStart = input.indexOf(markers.prefix);
+    const suffixStart = input.indexOf(markers.suffix);
+    if (prefixStart < 0 || suffixStart < 0 || suffixStart < prefixStart) {
+      continue;
+    }
+
+    const prefix = input.slice(prefixStart + markers.prefix.length, suffixStart);
+    const middleStart = input.indexOf(markers.middle, suffixStart + markers.suffix.length);
+    const suffix = middleStart >= 0
+      ? input.slice(suffixStart + markers.suffix.length, middleStart)
+      : input.slice(suffixStart + markers.suffix.length);
+
+    return {
+      prefix,
+      suffix,
+      markers
+    };
+  }
+
+  return null;
+}
+
+function buildFimInstruction({ prefix, suffix }) {
+  return [
+    "You are completing code at a cursor position.",
+    "Return only the missing code that should appear between PREFIX and SUFFIX.",
+    "Do not repeat PREFIX or SUFFIX. Do not wrap in markdown fences.",
+    "PREFIX:",
+    prefix,
+    "SUFFIX:",
+    suffix
+  ].join("\n");
+}
+
+function normalizeFimResponse(text, fimPrompt) {
+  if (!text) {
+    return text;
+  }
+
+  let normalized = text;
+  normalized = normalized.replace(/^<\|?fim_middle\|?>/, "");
+
+  if (fimPrompt.prefix && normalized.startsWith(fimPrompt.prefix)) {
+    normalized = normalized.slice(fimPrompt.prefix.length);
+  }
+  if (fimPrompt.suffix) {
+    const suffixIndex = normalized.indexOf(fimPrompt.suffix);
+    if (suffixIndex >= 0) {
+      normalized = normalized.slice(0, suffixIndex);
+    }
+  }
+
+  return normalized;
+}
+
+function stripSingleCodeFence(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("```") || !trimmed.endsWith("```")) {
+    return text;
+  }
+
+  const match = trimmed.match(/^```[^\n]*\n([\s\S]*?)\n```$/);
+  if (!match) {
+    return text;
+  }
+
+  return match[1].trimEnd();
+}
+
+function applyStopSequences(text, stop) {
+  if (!stop || !text) {
+    return text;
+  }
+
+  const stops = Array.isArray(stop) ? stop : [stop];
+  const indices = stops
+    .map(s => (s ? text.indexOf(s) : -1))
+    .filter(i => i >= 0);
+
+  if (!indices.length) {
+    return text;
+  }
+
+  const cutoff = Math.min(...indices);
+  return text.slice(0, cutoff);
+}
+
+function commonPrefixLength(a, b) {
+  const maxLen = Math.min(a.length, b.length);
+  for (let i = 0; i < maxLen; i += 1) {
+    if (a[i] !== b[i]) {
+      return i;
+    }
+  }
+  return maxLen;
+}

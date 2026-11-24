@@ -1,0 +1,6 @@
+# Python 3.12 or newer.
+# OpenHands versions match the local software-agent-sdk checkout.
+# LiteLLM and other transitive dependencies are installed by these packages.
+openhands-sdk==1.44.1
+openhands-tools==1.44.1
+python-dotenv==1.2.2
