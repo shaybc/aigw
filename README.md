@@ -122,7 +122,7 @@ process. The SDK terminal tool also needs its platform runtime dependencies
 
 1. Configure `.env` and start AIGW with `npm start` in a separate terminal.
 2. Edit the multiline `PROMPT` and `WORKSPACE` in `ohands.py`.
-3. Activate your SDK's Python environment and run `run.cmd`. It installs
+3. Activate your SDK's Python environment and run `run-ohands.cmd`. It installs
    `requirements.txt` and launches `ohands.py`, stopping if installation fails.
    To launch without reinstalling requirements, use `python ohands.py`.
 
@@ -131,11 +131,11 @@ Python packages (including transitive dependencies):
 
 ```bat
 set "AIGW_WHEELHOUSE=C:\path\to\wheels"
-run.cmd
+run-ohands.cmd
 ```
 
 Without `AIGW_WHEELHOUSE`, pip uses its normal configured package index/cache.
-`run.cmd` uses the active `python` interpreter and requires Python 3.12 or newer.
+`run-ohands.cmd` uses the active `python` interpreter and requires Python 3.12 or newer.
 It runs from the AIGW project directory and does not start the gateway server.
 
 The runner registers terminal, file editor, and task tracker tools. The SDK's
@@ -159,3 +159,15 @@ Offline LiteLLM catalog settings are applied before SDK imports. Tokenizer data,
 project dependencies, and any external integrations still need offline preparation.
 Runner tests use SDK mocks: `python -m unittest discover -s tests -p test_run.py`.
 An actual SDK/model run must be verified in your prepared enterprise environment.
+
+## Windows launchers
+
+Start `run-aigw.cmd` to check Node.js 22+ and the installed runtime dependencies.
+If dependencies are missing or invalid, it runs `npm ci --no-audit --no-fund`
+using your configured npm registry, then starts AIGW. A valid installed dependency
+tree is reused without reinstalling it. Configure your internal Artifactory npm
+registry through your existing npm configuration before running this launcher.
+
+In another terminal, use `run-ohands.cmd` to install the Python requirements
+through your configured pip registry (or `AIGW_WHEELHOUSE`) and run `ohands.py`.
+The two launchers change to the project directory before running commands.
